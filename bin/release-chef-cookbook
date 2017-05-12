@@ -1,0 +1,7 @@
+#!/bin/bash
+
+eval "$(chef shell-init bash)"
+
+echo "** If you see this, change bamboo script to call test-chef-cookbook **"
+
+rake bamboo

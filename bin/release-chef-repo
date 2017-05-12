@@ -1,0 +1,160 @@
+#!/bin/bash
+
+# requirements
+#  * must be executed from the "top" directory of the chef-repo repo
+#  * the chef-repo MUST be the first repo checked out by bamboo
+
+# fetch/simplify bamboo build variables
+
+CHEF_SERVER_URL="$bamboo_CHEF_SERVER_URL"
+CHEF_ORG="$bamboo_CHEF_ORG"
+branch="$bamboo_planRepository_1_branch"
+#       ^^ there is also _branchName.  I don't know the difference
+
+echo "> BEGIN BUILD PHASE"
+
+echo ">> creating .chef/ from morestuff/"
+
+cp -r morestuff/.chef .
+
+echo ">> Apply overlays if present"
+
+overlays="chef-repo-prod"
+for overlay in $overlays; do
+    if [ -d $overlay ]; then
+        echo "> Applying $overlay overlay"
+        cp -r $overlay/* .
+    fi
+done
+
+echo ">> creating .chef/knife.rb"
+
+echo ">>> chef server url is $CHEF_SERVER_URL"
+echo ">>> chef org is ${CHEF_ORG:-empty}"
+
+if [ -n "$CHEF_ORG" -a "$CHEF_ORG" != "none" ]; then
+    # append the org
+    CHEF_SERVER_URL="${CHEF_SERVER_URL}/organizations/${CHEF_ORG}"
+fi
+
+cat <<EOF > .chef/knife.rb
+current_dir = File.dirname(__FILE__)
+log_level                :info
+log_location             STDOUT
+node_name                "continuous"
+client_key               "#{current_dir}/continuous.pem"
+chef_server_url          "$CHEF_SERVER_URL"
+cache_type               'BasicFile'
+cache_options( :path => "#{ENV['HOME']}/.chef/checksums" )
+cookbook_path            ["#{current_dir}/../cookbooks" ]
+EOF
+
+echo "> END BUILD PHASE"
+
+echo "> BEGIN CHECK PHASE"
+
+echo ">> validating JSON (.json) files"
+
+if which jq 2>/dev/null; then
+    JQ=jq
+elif which jq-linux64 2>/dev/null; then
+    JQ=jq-linux64
+elif [ -x /opt/jq-linux64 2>/dev/null ]; then
+    JQ=/opt/jq-linux64
+else
+    echo >&2 "error: unable to find jq"
+    exit 1
+fi
+echo ">>> using $JQ for JSON validation"
+
+all_json=$( find . -name '*.[Jj][Ss][Oo][Nn]' -type f )
+
+errs=0
+for json_file in $all_json; do
+  echo ">>> validating $json_file for syntax"
+  cat $json_file | $JQ . >/dev/null
+  if [ $? != 0 ]; then
+      errs=$(( $errs + 1 ))
+  fi
+done
+
+roles_envs_json=$( find roles environments -name '*.[Jj][Ss][Oo][Nn]' -type f )
+
+for json_file in $roles_envs_json; do
+    echo ">>> validating $json_file for some content"
+    j_name=$( $JQ -r .name $json_file )
+    if [ "$j_name" != $(basename $json_file .json) ]; then
+        echo >&2 "!!! error: name attribute ($j_name) does not match file name"
+        errs=$(( $errs + 1 ))
+    fi
+done
+
+if [ $errs != 0 ]; then
+    echo >&2 "!! error: one or more JSON files failed validation check"
+    exit 1
+fi
+
+echo "> check berks cookbook resolution"
+
+if [ -r Berksfile.lock ]; then
+    echo ">> resolving cookbook dependencies with berks update"
+    berks update
+else
+    echo ">> resolving cookbook dependencies with berks install"
+    berks install
+fi
+
+rc=$?
+if [ $rc != 0 ]; then
+    echo "!! error: berks cookbook resolution failed, exiting with rc=$rc"
+    exit $rc
+fi
+
+echo "> END CHECK PHASE"
+
+# if this is not the master branch of the chef repo, exit out
+# we do not want to publish non-master branches!
+
+if [ "$branch" != "master" ]; then
+    echo "SUCCESS: chef-repo branch $branch processing completed"
+    exit 0
+fi
+
+echo "> BEGIN PUBLISH PHASE"
+
+echo ">> publish chef-repo to $CHEF_SERVER_URL"
+
+failrc=0
+for x in roles environments data_bags; do
+    echo ">>> uploading $x via knife"
+    knife upload $x --chef-repo-path .
+    rc=$?
+    if [ $rc != 0 ]; then
+        echo "!! knife upload $x FAILED with rc=$rc!!"
+        failrc=$rc
+    fi
+done
+
+if [ $failrc != 0 ]; then
+    echo "!! error: one or mmore knife uploads failed, exiting with rc=$failrc"
+    exit $failrc
+fi
+
+echo ">>> uploading cookbooks via berks"
+berks upload
+rc=$?
+
+if [ $rc != 0 ]; then
+    echo "!! error: cookbook upload failed with rc=$rc"
+    exit $rc
+fi
+
+echo "> END PUBLISH PHASE"
+
+echo "SUCCESS: chef-repo processing completed"
+exit 0
+
+
+# Local Variables:
+# indent-tabs-mode: nil
+# End:
